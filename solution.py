@@ -15,10 +15,12 @@ data = api_result["data"] # grabs only the "data" element from the response
 
 for flight in data: # loops through all flights 
     if (flight["flight_status"] == "active"): # checks if flight is active 
+    if (flight["arrival"]["airport"]=="Sydney"): #arrivals to SYD
         print("Flight airline: " + flight["airline"]["name"]) # airline
         print("Flight date: " + flight["flight_date"]) # date of flight
         print("Flight departure airport: " + flight["departure"]["airport"]) # departure airport
         print("Flight arrival airport: " + flight["arrival"]["airport"]) # arrival airport
-        print("Flight number: " + flight["departure"]["iata"]) # iata code departure
+        print("Flight departure IATA: " + flight["departure"]["iata"]) # iata code departure
+        
         print("-----------------------------------------------")
         
