@@ -19,5 +19,6 @@ for flight in data: # loops through all flights
         print("Flight date: " + flight["flight_date"]) # date of flight
         print("Flight departure airport: " + flight["departure"]["airport"]) # departure airport
         print("Flight arrival airport: " + flight["arrival"]["airport"]) # arrival airport
+        print("Flight number: "=flight["departure"]["iata'])   #departure > iata
         print("-----------------------------------------------")
         
