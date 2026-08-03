@@ -16,8 +16,10 @@ ZONE_HOME = {
 # [lat, lon, earth_radius_km]
 LOCATION_HOME = [-33.922445, 151.269097, 6371]
 
-# Hide anything below this altitude (feet). 0 = no filter.
-MIN_ALTITUDE = 0
+# Hide anything at or below this altitude (feet). Filters tourist
+# helicopters / low circuits; airliners over the box are usually higher.
+# 0 = no filter.
+MIN_ALTITUDE = 2000
 
 # Optional: weather (only used by the weather scene)
 # OPENWEATHER_KEY = ""

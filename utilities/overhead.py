@@ -172,10 +172,10 @@ class Overhead:
         return flights
 
     def _lookup_route_adsblol(self, cs):
-        """adsb.lol: /api/0/route returns '_airport_codes_iata' like 'MCY-SYD'.
+        """adsb.lol: /api/0/route returns IATA codes plus `_airports` with location.
 
         Returns (origin_iata, destination_iata, origin_city, destination_city).
-        Cities are always blank — this API only provides IATA codes.
+        City is taken from each airport's `location` (municipality).
         """
         empty = ("", "", "", "")
         try:
@@ -192,8 +192,13 @@ class Overhead:
             parts = [p.strip() for p in iata.split("-") if p.strip()]
             origin = parts[0] if parts else ""
             destination = parts[-1] if len(parts) > 1 else ""
-            return (origin, destination, "", "")
-        except (requests.RequestException, ValueError):
+            airports = payload.get("_airports") or []
+            origin_city = _clean(airports[0].get("location")) if len(airports) > 0 else ""
+            destination_city = (
+                _clean(airports[-1].get("location")) if len(airports) > 1 else ""
+            )
+            return (origin, destination, origin_city, destination_city)
+        except (requests.RequestException, ValueError, AttributeError, TypeError):
             return empty
 
     def _lookup_route_adsbdb(self, cs):

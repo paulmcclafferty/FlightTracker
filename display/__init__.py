@@ -18,14 +18,22 @@ import sys
 import time
 import urllib.request
 import json
-from datetime import datetime
+from datetime import datetime, date
 from functools import lru_cache
 from threading import Lock
+from zoneinfo import ZoneInfo
 
 from rgbmatrix import RGBMatrix, RGBMatrixOptions, graphics
 
 from setup import colours, fonts, screen
 from utilities.overhead import Overhead
+
+try:
+    from astral import LocationInfo
+    from astral.sun import sun as astral_sun
+except ImportError:
+    LocationInfo = None
+    astral_sun = None
 
 try:
     from config import BRIGHTNESS, GPIO_SLOWDOWN, HAT_PWM_ENABLED
@@ -75,12 +83,29 @@ DATE_COLOUR = colours.PINK_DARKER
 TEMP_POS = (48, 6)
 TEMP_FONT = fonts.extrasmall
 
+# Idle-screen sunrise / sunset stack under temperature (option A)
+SUN_ICON_X = 36
+SUNRISE_ICON_Y = 10          # top of 5px-tall glyph
+SUNSET_ICON_Y = 17
+SUN_TIME_X = 44
+SUNRISE_TIME_POS = (SUN_TIME_X, 14)
+SUNSET_TIME_POS = (SUN_TIME_X, 21)
+SUN_TIME_FONT = fonts.extrasmall
+SUNRISE_COLOUR = graphics.Color(255, 179, 71)   # warm gold
+SUNSET_COLOUR = graphics.Color(255, 106, 61)    # orange-red
+LOCAL_TZ = ZoneInfo("Australia/Sydney")
+
 # Full-name journey layout (ColinWaddell FlightTracker full_label.py)
 #   line 1: ORIGIN > municipality
 #   line 2: DEST   < municipality
-JOURNEY_FONT = fonts.small
-JOURNEY_LINE_Y = (6, 14)
+# Journey uses the larger regular font; callsign / plane type stay compact.
+JOURNEY_FONT = fonts.regular
+JOURNEY_LINE_Y = (8, 18)
 JOURNEY_TEXT_X = 1
+# 6x12 glyphs sit mostly above the baseline. Bands must not overlap between
+# the two journey lines (y=8 and y=18) or letters get clipped (Sydney → svdnev).
+JOURNEY_CLEAR_ABOVE = 8
+JOURNEY_CLEAR_BELOW = 1
 JOURNEY_ORIGIN_COLOUR = graphics.Color(255, 215, 0)       # GOLD
 JOURNEY_DEST_COLOUR = graphics.Color(255, 255, 0)         # YELLOW
 JOURNEY_ORIGIN_ARROW_COLOUR = graphics.Color(50, 205, 50) # LIME_GREEN
@@ -90,18 +115,18 @@ JOURNEY_DEST_CITY_COLOUR = graphics.Color(255, 173, 114)  # PEACH
 JOURNEY_UNKNOWN_CITY = "Unknown"
 JOURNEY_BOUNCE_PAUSE_FRAMES = 15
 
-FLIGHT_NO_POS = (1, 21)
-FLIGHT_NO_FONT = fonts.small
+FLIGHT_NO_POS = (1, 26)
+FLIGHT_NO_FONT = fonts.extrasmall
 FLIGHT_NO_COLOUR_ALPHA = colours.BLUE
 FLIGHT_NO_COLOUR_NUM = colours.BLUE_LIGHT
-FLIGHT_BAR_Y = 18
+FLIGHT_BAR_Y = 23
 FLIGHT_BAR_COLOUR = colours.GREEN
-FLIGHT_INDEX_POS = (52, 21)
+FLIGHT_INDEX_POS = (52, 26)
 FLIGHT_INDEX_FONT = fonts.extrasmall
 FLIGHT_INDEX_COLOUR = colours.GREY
 
-PLANE_TYPE_FONT = fonts.regular
-PLANE_TYPE_Y = 30
+PLANE_TYPE_FONT = fonts.extrasmall
+PLANE_TYPE_Y = 31
 PLANE_TYPE_COLOUR = colours.PINK
 
 LOADING_PULSE_POS = (63, 0)
@@ -139,6 +164,28 @@ def get_temperature():
     except Exception as e:
         print(f"weather fetch failed: {e}", file=sys.stderr)
         return None
+
+
+@lru_cache(maxsize=2)
+def _sun_times_for_day(day_iso):
+    """Return (sunrise_HHMM, sunset_HHMM) for the given ISO date, or (None, None)."""
+    if LocationInfo is None or astral_sun is None:
+        return (None, None)
+    try:
+        day = date.fromisoformat(day_iso)
+        loc = LocationInfo("Home", "Australia", "Australia/Sydney", LAT, LON)
+        s = astral_sun(loc.observer, date=day, tzinfo=LOCAL_TZ)
+        return (
+            s["sunrise"].strftime("%H:%M"),
+            s["sunset"].strftime("%H:%M"),
+        )
+    except Exception as e:
+        print(f"sun times failed: {e}", file=sys.stderr)
+        return (None, None)
+
+
+def get_sun_times():
+    return _sun_times_for_day(datetime.now(LOCAL_TZ).date().isoformat())
 
 
 def colour_gradient(c1, c2, ratio):
@@ -261,18 +308,50 @@ class Display:
             graphics.DrawLine(self.canvas, x, y0, x, y1, colour)
 
     def _text_width(self, font, text):
-        # DrawText returns advance width; draw off-canvas to measure.
-        return graphics.DrawText(self.canvas, font, -1000, -1000, colours.BLACK, text)
+        """Pixel advance width without touching the canvas."""
+        return sum(font.CharacterWidth(ord(ch)) for ch in text)
 
-    def _draw_city_bounce(self, scroller, key, text, x, y, available_width, colour):
-        """Draw municipality with bounce-scroll in the remaining line width."""
-        width = self._text_width(JOURNEY_FONT, text)
+    def _draw_city_bounce(self, scroller, key, city, x, y, available_width, colour):
+        """Draw municipality in the city slot; bounce only if it doesn't fit.
+
+        May briefly paint into the prefix columns while scrolling; caller must
+        redraw the IATA/arrow afterwards so codes stay fixed.
+        """
+        city = city or ""
+        width = self._text_width(JOURNEY_FONT, city)
         scroller.reset_if_changed(key)
-        offset = scroller.step(width, available_width)
 
-        # Clip by clearing the city region, then draw at negative offset.
-        self.fill_rect(x, y - 6, screen.WIDTH - 1, y + 1, colours.BLACK)
-        graphics.DrawText(self.canvas, JOURNEY_FONT, x - offset, y, colour, text)
+        top = y - JOURNEY_CLEAR_ABOVE
+        bottom = y + JOURNEY_CLEAR_BELOW
+        # Clear only the city slot (to the right of > / <).
+        self.fill_rect(x, top, screen.WIDTH - 1, bottom, colours.BLACK)
+
+        if width <= available_width:
+            scroller.step(0, 1)
+            graphics.DrawText(self.canvas, JOURNEY_FONT, x, y, colour, city)
+            return
+
+        scroll_text = city + " "
+        scroll_width = self._text_width(JOURNEY_FONT, scroll_text)
+        offset = scroller.step(scroll_width, available_width)
+        graphics.DrawText(
+            self.canvas, JOURNEY_FONT, x - offset, y, colour, scroll_text,
+        )
+
+    def _draw_journey_prefix(self, code, arrow, arrow_colour, code_colour, y, city_x):
+        """Clear prefix columns and redraw static IATA + direction glyph."""
+        top = y - JOURNEY_CLEAR_ABOVE
+        bottom = y + JOURNEY_CLEAR_BELOW
+        if city_x > 0:
+            self.fill_rect(0, top, city_x - 1, bottom, colours.BLACK)
+        graphics.DrawText(
+            self.canvas, JOURNEY_FONT, JOURNEY_TEXT_X, y, code_colour, code,
+        )
+        code_w = self._text_width(JOURNEY_FONT, code)
+        graphics.DrawText(
+            self.canvas, JOURNEY_FONT, JOURNEY_TEXT_X + code_w, y,
+            arrow_colour, arrow,
+        )
 
     # -------- home scenes (no plane data) --------
     def draw_clock(self):
@@ -285,7 +364,7 @@ class Display:
     def draw_day(self):
         graphics.DrawText(
             self.canvas, DAY_FONT, DAY_POS[0], DAY_POS[1],
-            DAY_COLOUR, datetime.now().strftime("%A"),
+            DAY_COLOUR, datetime.now().strftime("%a"),  # Mon Tue Wed...
         )
 
     def draw_date(self):
@@ -303,6 +382,48 @@ class Display:
             temp_to_colour(temp_c), text,
         )
 
+    def _set_px(self, x, y, colour):
+        if 0 <= x < screen.WIDTH and 0 <= y < screen.HEIGHT:
+            self.canvas.SetPixel(x, y, colour.red, colour.green, colour.blue)
+
+    def draw_sunrise_icon(self, x, y, colour):
+        """Half-circle above a horizon line (sunrise). 7×5 px."""
+        # horizon
+        for dx in range(7):
+            self._set_px(x + dx, y + 2, colour)
+        # upper semicircle
+        for dx, dy in ((1, 1), (2, 1), (3, 1), (4, 1), (5, 1),
+                       (2, 0), (3, 0), (4, 0)):
+            self._set_px(x + dx, y + dy, colour)
+
+    def draw_sunset_icon(self, x, y, colour):
+        """Half-circle below a horizon line (sunset). 7×5 px."""
+        # horizon
+        for dx in range(7):
+            self._set_px(x + dx, y + 2, colour)
+        # lower semicircle
+        for dx, dy in ((1, 3), (2, 3), (3, 3), (4, 3), (5, 3),
+                       (2, 4), (3, 4), (4, 4)):
+            self._set_px(x + dx, y + dy, colour)
+
+    def draw_sun_times(self):
+        """Stack sunrise / sunset under the temperature (idle option A)."""
+        sunrise, sunset = get_sun_times()
+        if sunrise:
+            self.draw_sunrise_icon(SUN_ICON_X, SUNRISE_ICON_Y, SUNRISE_COLOUR)
+            graphics.DrawText(
+                self.canvas, SUN_TIME_FONT,
+                SUNRISE_TIME_POS[0], SUNRISE_TIME_POS[1],
+                SUNRISE_COLOUR, sunrise,
+            )
+        if sunset:
+            self.draw_sunset_icon(SUN_ICON_X, SUNSET_ICON_Y, SUNSET_COLOUR)
+            graphics.DrawText(
+                self.canvas, SUN_TIME_FONT,
+                SUNSET_TIME_POS[0], SUNSET_TIME_POS[1],
+                SUNSET_COLOUR, sunset,
+            )
+
     # -------- plane scenes (data present) --------
     def draw_journey(self):
         """Two-line full-name layout from Colin's full_label.py.
@@ -316,31 +437,24 @@ class Display:
         origin_city = rec.get("origin_city") or JOURNEY_UNKNOWN_CITY
         destination_city = rec.get("destination_city") or JOURNEY_UNKNOWN_CITY
 
-        # Static prefixes: IATA + arrow
-        origin_x = JOURNEY_TEXT_X + graphics.DrawText(
-            self.canvas, JOURNEY_FONT, JOURNEY_TEXT_X, JOURNEY_LINE_Y[0],
-            JOURNEY_ORIGIN_COLOUR, origin,
+        # Measure where city slots start (IATA + arrow stay fixed).
+        origin_x = (
+            JOURNEY_TEXT_X
+            + self._text_width(JOURNEY_FONT, origin)
+            + self._text_width(JOURNEY_FONT, ">")
         )
-        origin_x += graphics.DrawText(
-            self.canvas, JOURNEY_FONT, origin_x, JOURNEY_LINE_Y[0],
-            JOURNEY_ORIGIN_ARROW_COLOUR, ">",
-        )
-
-        dest_x = JOURNEY_TEXT_X + graphics.DrawText(
-            self.canvas, JOURNEY_FONT, JOURNEY_TEXT_X, JOURNEY_LINE_Y[1],
-            JOURNEY_DEST_COLOUR, destination,
-        )
-        dest_x += graphics.DrawText(
-            self.canvas, JOURNEY_FONT, dest_x, JOURNEY_LINE_Y[1],
-            JOURNEY_DEST_ARROW_COLOUR, "<",
+        dest_x = (
+            JOURNEY_TEXT_X
+            + self._text_width(JOURNEY_FONT, destination)
+            + self._text_width(JOURNEY_FONT, "<")
         )
 
-        # City names bounce-scroll in the remaining width
+        # City names scroll only to the right of > / <, and only if too wide.
         route_key = f"{origin}-{destination}-{self._data_index}"
         self._draw_city_bounce(
             self._origin_city_scroll,
             f"o:{route_key}:{origin_city}",
-            f"{origin_city} ",
+            origin_city,
             origin_x,
             JOURNEY_LINE_Y[0],
             max(1, screen.WIDTH - origin_x),
@@ -349,11 +463,21 @@ class Display:
         self._draw_city_bounce(
             self._dest_city_scroll,
             f"d:{route_key}:{destination_city}",
-            f"{destination_city} ",
+            destination_city,
             dest_x,
             JOURNEY_LINE_Y[1],
             max(1, screen.WIDTH - dest_x),
             JOURNEY_DEST_CITY_COLOUR,
+        )
+
+        # Draw prefixes last so a scrolling city never covers the airport code.
+        self._draw_journey_prefix(
+            origin, ">", JOURNEY_ORIGIN_ARROW_COLOUR, JOURNEY_ORIGIN_COLOUR,
+            JOURNEY_LINE_Y[0], origin_x,
+        )
+        self._draw_journey_prefix(
+            destination, "<", JOURNEY_DEST_ARROW_COLOUR, JOURNEY_DEST_COLOUR,
+            JOURNEY_LINE_Y[1], dest_x,
         )
 
     def draw_flight_details(self):
@@ -494,6 +618,7 @@ class Display:
                     self.draw_day()
                     self.draw_date()
                     self.draw_temperature(get_temperature())
+                    self.draw_sun_times()
 
                 self.draw_loading_pulse()
                 self.update_loading_led()
