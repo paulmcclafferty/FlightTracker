@@ -3,7 +3,7 @@ overhead.py - pull live ADS-B traffic inside the home bounding box.
 
 Two free public APIs, no keys:
   1. adsb.lol   -> live positions, aircraft type, flight number
-  2. adsbdb.com -> callsign -> origin / destination route lookup
+  2. adsbdb.com -> callsign -> origin / destination / municipality
 
 Route lookups are cached per callsign in memory.
 """
@@ -172,7 +172,12 @@ class Overhead:
         return flights
 
     def _lookup_route_adsblol(self, cs):
-        """adsb.lol: /api/0/route returns '_airport_codes_iata' like 'MCY-SYD'."""
+        """adsb.lol: /api/0/route returns '_airport_codes_iata' like 'MCY-SYD'.
+
+        Returns (origin_iata, destination_iata, origin_city, destination_city).
+        Cities are always blank — this API only provides IATA codes.
+        """
+        empty = ("", "", "", "")
         try:
             r = self._session.get(
                 ADSB_LOL_ROUTE_URL.format(callsign=cs),
@@ -180,48 +185,59 @@ class Overhead:
                 allow_redirects=True,
             )
             if r.status_code == 404:
-                return ("", "")
+                return empty
             r.raise_for_status()
             payload = r.json() or {}
             iata = payload.get("_airport_codes_iata") or ""
             parts = [p.strip() for p in iata.split("-") if p.strip()]
             origin = parts[0] if parts else ""
             destination = parts[-1] if len(parts) > 1 else ""
-            return (origin, destination)
+            return (origin, destination, "", "")
         except (requests.RequestException, ValueError):
-            return ("", "")
+            return empty
 
     def _lookup_route_adsbdb(self, cs):
-        """adsbdb.com: /v0/callsign returns flightroute with origin/destination."""
+        """adsbdb.com: /v0/callsign returns flightroute with origin/destination.
+
+        Returns (origin_iata, destination_iata, origin_city, destination_city)
+        where city is the airport municipality.
+        """
+        empty = ("", "", "", "")
         try:
             r = self._session.get(
                 ADSBDB_CALLSIGN_URL.format(callsign=cs),
                 timeout=REQUEST_TIMEOUT,
             )
             if r.status_code == 404:
-                return ("", "")
+                return empty
             r.raise_for_status()
             payload = r.json() or {}
             route = (payload.get("response") or {}).get("flightroute") or {}
-            origin = _clean((route.get("origin") or {}).get("iata_code"))
-            destination = _clean((route.get("destination") or {}).get("iata_code"))
-            return (origin, destination)
+            origin_ap = route.get("origin") or {}
+            dest_ap = route.get("destination") or {}
+            origin = _clean(origin_ap.get("iata_code"))
+            destination = _clean(dest_ap.get("iata_code"))
+            origin_city = _clean(origin_ap.get("municipality"))
+            destination_city = _clean(dest_ap.get("municipality"))
+            return (origin, destination, origin_city, destination_city)
         except (requests.RequestException, ValueError):
-            return ("", "")
+            return empty
 
     def _lookup_route(self, callsign):
-        """callsign -> (origin_iata, destination_iata). Cached.
-        Tries adsb.lol first, then falls back to adsbdb.com on miss.
+        """callsign -> (origin, destination, origin_city, destination_city). Cached.
+
+        Prefer adsbdb.com (IATA + municipality). Fall back to adsb.lol for
+        IATA-only when adsbdb misses.
         """
         cs = callsign.strip().upper()
         if not cs:
-            return ("", "")
+            return ("", "", "", "")
         if cs in self._route_cache:
             return self._route_cache[cs]
 
-        result = self._lookup_route_adsblol(cs)
-        if result == ("", ""):
-            result = self._lookup_route_adsbdb(cs)
+        result = self._lookup_route_adsbdb(cs)
+        if result[0] == "" and result[1] == "":
+            result = self._lookup_route_adsblol(cs)
 
         self._route_cache[cs] = result
         return result
@@ -244,19 +260,27 @@ class Overhead:
             for flight in flights[:MAX_FLIGHT_LOOKUP]:
                 sleep(RATE_LIMIT_DELAY)     # be polite to adsbdb
 
-                origin, destination = self._lookup_route(flight.callsign)
+                origin, destination, origin_city, destination_city = self._lookup_route(
+                    flight.callsign
+                )
                 flight.origin_airport_iata = origin
                 flight.destination_airport_iata = destination
 
                 plane = flight.aircraft_model if flight.aircraft_model.upper() not in BLANK_FIELDS else ""
                 origin = origin if origin.upper() not in BLANK_FIELDS else ""
                 destination = destination if destination.upper() not in BLANK_FIELDS else ""
+                origin_city = origin_city if origin_city.upper() not in BLANK_FIELDS else ""
+                destination_city = (
+                    destination_city if destination_city.upper() not in BLANK_FIELDS else ""
+                )
                 callsign = flight.callsign if flight.callsign.upper() not in BLANK_FIELDS else ""
 
                 data.append({
                     "plane": plane,
                     "origin": origin,
                     "destination": destination,
+                    "origin_city": origin_city,
+                    "destination_city": destination_city,
                     "vertical_speed": flight.vertical_speed,
                     "altitude": flight.altitude,
                     "callsign": callsign,

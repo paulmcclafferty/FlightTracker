@@ -12,9 +12,9 @@ overhead it shows the time, day, date and outdoor temperature.
 
 **When one or more aircraft are inside the bounding box**
 
-- Top half: origin IATA, an arrow, destination IATA (e.g. `MEL → SYD`).
-  If either airport matches `JOURNEY_CODE_SELECTED` in `config.py` it is
-  rendered in bold.
+- Top two lines: Colin-style full-name journey — `SYD>Sydney` then
+  `MEL<Melbourne` (IATA + direction glyph + municipality; city
+  bounce-scrolls when too long).
 - Mid line: callsign, colour-coded alpha vs. numeric. If more than one
   plane is overhead the right edge shows `N/M` and pages between them.
 - Bottom line: aircraft ICAO type code (e.g. `A339`, `B789`), scrolling

@@ -47,11 +47,6 @@ except (ModuleNotFoundError, NameError, ImportError):
     LAT, LON = -33.92, 151.27
 
 try:
-    from config import JOURNEY_CODE_SELECTED
-except (ModuleNotFoundError, NameError, ImportError):
-    JOURNEY_CODE_SELECTED = "SYD"
-
-try:
     from config import JOURNEY_BLANK_FILLER
 except (ModuleNotFoundError, NameError, ImportError):
     JOURNEY_BLANK_FILLER = " ? "
@@ -80,14 +75,20 @@ DATE_COLOUR = colours.PINK_DARKER
 TEMP_POS = (48, 6)
 TEMP_FONT = fonts.extrasmall
 
-JOURNEY_HEIGHT = 12
-JOURNEY_FONT = fonts.large
-JOURNEY_FONT_BOLD = fonts.large_bold
-JOURNEY_COLOUR = colours.YELLOW
-ARROW_POINT_POS = (34, 7)
-ARROW_WIDTH = 4
-ARROW_HEIGHT = 8
-ARROW_COLOUR = colours.ORANGE
+# Full-name journey layout (ColinWaddell FlightTracker full_label.py)
+#   line 1: ORIGIN > municipality
+#   line 2: DEST   < municipality
+JOURNEY_FONT = fonts.small
+JOURNEY_LINE_Y = (6, 14)
+JOURNEY_TEXT_X = 1
+JOURNEY_ORIGIN_COLOUR = graphics.Color(255, 215, 0)       # GOLD
+JOURNEY_DEST_COLOUR = graphics.Color(255, 255, 0)         # YELLOW
+JOURNEY_ORIGIN_ARROW_COLOUR = graphics.Color(50, 205, 50) # LIME_GREEN
+JOURNEY_DEST_ARROW_COLOUR = graphics.Color(255, 69, 0)    # ORANGE_RED
+JOURNEY_ORIGIN_CITY_COLOUR = graphics.Color(100, 130, 0)  # MOSS
+JOURNEY_DEST_CITY_COLOUR = graphics.Color(255, 173, 114)  # PEACH
+JOURNEY_UNKNOWN_CITY = "Unknown"
+JOURNEY_BOUNCE_PAUSE_FRAMES = 15
 
 FLIGHT_NO_POS = (1, 21)
 FLIGHT_NO_FONT = fonts.small
@@ -161,6 +162,44 @@ def temp_to_colour(t):
     return pairs[0][1]
 
 
+class BounceScroller:
+    """Bounce-scroll text within a fixed width (Colin's FullNameLabel behaviour)."""
+
+    def __init__(self):
+        self._key = None
+        self._offset = 0
+        self._direction = 1
+        self._pause = JOURNEY_BOUNCE_PAUSE_FRAMES
+
+    def reset_if_changed(self, key):
+        if key != self._key:
+            self._key = key
+            self._offset = 0
+            self._direction = 1
+            self._pause = JOURNEY_BOUNCE_PAUSE_FRAMES
+
+    def step(self, text_width, available_width):
+        overflow = text_width - available_width
+        if overflow <= 0:
+            self._offset = 0
+            return 0
+
+        if self._pause > 0:
+            self._pause -= 1
+            return self._offset
+
+        self._offset += self._direction
+        if self._offset >= overflow:
+            self._offset = overflow
+            self._direction = -1
+            self._pause = JOURNEY_BOUNCE_PAUSE_FRAMES
+        elif self._offset <= 0:
+            self._offset = 0
+            self._direction = 1
+            self._pause = JOURNEY_BOUNCE_PAUSE_FRAMES
+        return self._offset
+
+
 # ---------------- optional GPIO loading LED ----------------
 _gpio = None
 if LOADING_LED_ENABLED:
@@ -204,6 +243,8 @@ class Display:
         self._data_index = 0
         self._plane_position = screen.WIDTH
         self._plane_hold_remaining = 0
+        self._origin_city_scroll = BounceScroller()
+        self._dest_city_scroll = BounceScroller()
 
         self._last_data_check = 0.0
         self._last_data_grab = 0.0
@@ -218,6 +259,20 @@ class Display:
         if y0 > y1: y0, y1 = y1, y0
         for x in range(x0, x1 + 1):
             graphics.DrawLine(self.canvas, x, y0, x, y1, colour)
+
+    def _text_width(self, font, text):
+        # DrawText returns advance width; draw off-canvas to measure.
+        return graphics.DrawText(self.canvas, font, -1000, -1000, colours.BLACK, text)
+
+    def _draw_city_bounce(self, scroller, key, text, x, y, available_width, colour):
+        """Draw municipality with bounce-scroll in the remaining line width."""
+        width = self._text_width(JOURNEY_FONT, text)
+        scroller.reset_if_changed(key)
+        offset = scroller.step(width, available_width)
+
+        # Clip by clearing the city region, then draw at negative offset.
+        self.fill_rect(x, y - 6, screen.WIDTH - 1, y + 1, colours.BLACK)
+        graphics.DrawText(self.canvas, JOURNEY_FONT, x - offset, y, colour, text)
 
     # -------- home scenes (no plane data) --------
     def draw_clock(self):
@@ -250,39 +305,55 @@ class Display:
 
     # -------- plane scenes (data present) --------
     def draw_journey(self):
+        """Two-line full-name layout from Colin's full_label.py.
+
+        ORIGIN>City
+        DEST<City
+        """
         rec = self._data[self._data_index]
         origin = rec.get("origin") or JOURNEY_BLANK_FILLER
         destination = rec.get("destination") or JOURNEY_BLANK_FILLER
+        origin_city = rec.get("origin_city") or JOURNEY_UNKNOWN_CITY
+        destination_city = rec.get("destination_city") or JOURNEY_UNKNOWN_CITY
 
-        # Origin (left)
-        font = JOURNEY_FONT_BOLD if origin == JOURNEY_CODE_SELECTED else JOURNEY_FONT
-        text_len = graphics.DrawText(
-            self.canvas, font, 1, JOURNEY_HEIGHT,
-            JOURNEY_COLOUR, origin,
+        # Static prefixes: IATA + arrow
+        origin_x = JOURNEY_TEXT_X + graphics.DrawText(
+            self.canvas, JOURNEY_FONT, JOURNEY_TEXT_X, JOURNEY_LINE_Y[0],
+            JOURNEY_ORIGIN_COLOUR, origin,
+        )
+        origin_x += graphics.DrawText(
+            self.canvas, JOURNEY_FONT, origin_x, JOURNEY_LINE_Y[0],
+            JOURNEY_ORIGIN_ARROW_COLOUR, ">",
         )
 
-        # Destination (right of arrow)
-        font = JOURNEY_FONT_BOLD if destination == JOURNEY_CODE_SELECTED else JOURNEY_FONT
-        graphics.DrawText(
-            self.canvas, font,
-            ARROW_POINT_POS[0] + 4, JOURNEY_HEIGHT,
-            JOURNEY_COLOUR, destination,
+        dest_x = JOURNEY_TEXT_X + graphics.DrawText(
+            self.canvas, JOURNEY_FONT, JOURNEY_TEXT_X, JOURNEY_LINE_Y[1],
+            JOURNEY_DEST_COLOUR, destination,
+        )
+        dest_x += graphics.DrawText(
+            self.canvas, JOURNEY_FONT, dest_x, JOURNEY_LINE_Y[1],
+            JOURNEY_DEST_ARROW_COLOUR, "<",
         )
 
-    def draw_journey_arrow(self):
-        # Filled arrow pointing right, tip at ARROW_POINT_POS
-        x = ARROW_POINT_POS[0] - ARROW_WIDTH
-        y1 = ARROW_POINT_POS[1] - (ARROW_HEIGHT // 2)
-        y2 = ARROW_POINT_POS[1] + (ARROW_HEIGHT // 2)
-        for col in range(ARROW_WIDTH):
-            graphics.DrawLine(self.canvas, x, y1, x, y2, ARROW_COLOUR)
-            x += 1
-            y1 += 1
-            y2 -= 1
-        # Tip pixel
-        self.canvas.SetPixel(
-            ARROW_POINT_POS[0], ARROW_POINT_POS[1],
-            ARROW_COLOUR.red, ARROW_COLOUR.green, ARROW_COLOUR.blue,
+        # City names bounce-scroll in the remaining width
+        route_key = f"{origin}-{destination}-{self._data_index}"
+        self._draw_city_bounce(
+            self._origin_city_scroll,
+            f"o:{route_key}:{origin_city}",
+            f"{origin_city} ",
+            origin_x,
+            JOURNEY_LINE_Y[0],
+            max(1, screen.WIDTH - origin_x),
+            JOURNEY_ORIGIN_CITY_COLOUR,
+        )
+        self._draw_city_bounce(
+            self._dest_city_scroll,
+            f"d:{route_key}:{destination_city}",
+            f"{destination_city} ",
+            dest_x,
+            JOURNEY_LINE_Y[1],
+            max(1, screen.WIDTH - dest_x),
+            JOURNEY_DEST_CITY_COLOUR,
         )
 
     def draw_flight_details(self):
@@ -391,6 +462,8 @@ class Display:
             self._data_index = 0
             self._plane_position = screen.WIDTH
             self._plane_hold_remaining = 0
+            self._origin_city_scroll = BounceScroller()
+            self._dest_city_scroll = BounceScroller()
         else:
             self._data = new
 
@@ -414,7 +487,6 @@ class Display:
                 self.canvas.Clear()
                 if self._data:
                     self.draw_journey()
-                    self.draw_journey_arrow()
                     self.draw_flight_details()
                     self.draw_plane_type_scrolling()
                 else:
